@@ -1,4 +1,4 @@
-name: CI Pipeline (Build + Test + Lint)
+name: CI Pipeline (Build-Test-Lint)
 
 on:
   push:
