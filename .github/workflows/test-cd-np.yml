@@ -1,4 +1,4 @@
-name: CD Pipeline (Dev → QA → UAT → Prod)
+name: CD Pipeline (Dev → QA → UAT)
 
 on:
   workflow_dispatch:
@@ -73,20 +73,6 @@ jobs:
 
       - name: Deploy to UAT
         run: echo "Deploying to UAT..."
-
-  deploy_prod:
-    name: Deploy to PROD
-    needs: deploy_uat
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - name: Download Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: app-${{ github.event.inputs.version }}
-
-      - name: Deploy to PROD
-        run: echo "Deploying to PROD..."
 
   rollback:
     name: Rollback Deployment
