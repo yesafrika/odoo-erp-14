@@ -1,0 +1,106 @@
+name: CD Pipeline (Dev → QA → UAT → Prod)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version/tag to deploy (e.g., v1.0.3)"
+        required: true
+      rollback:
+        description: "Rollback? true/false"
+        required: false
+        default: "false"
+
+jobs:
+
+  build_artifact:
+    name: Build Artifact (Dev)
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.rollback == 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package files
+        run: |
+          mkdir artifact
+          cp -R * artifact/
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ github.event.inputs.version }}
+          path: artifact/
+
+  deploy_dev:
+    name: Deploy to DEV
+    needs: build_artifact
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-${{ github.event.inputs.version }}
+
+      - name: Deploy to DEV
+        run: echo "Deploying to DEV..."
+
+  deploy_qa:
+    name: Deploy to QA
+    needs: deploy_dev
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-${{ github.event.inputs.version }}
+
+      - name: Deploy to QA
+        run: echo "Deploying to QA..."
+
+  deploy_uat:
+    name: Deploy to UAT
+    needs: deploy_qa
+    runs-on: ubuntu-latest
+    environment: uat
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-${{ github.event.inputs.version }}
+
+      - name: Deploy to UAT
+        run: echo "Deploying to UAT..."
+
+  deploy_prod:
+    name: Deploy to PROD
+    needs: deploy_uat
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-${{ github.event.inputs.version }}
+
+      - name: Deploy to PROD
+        run: echo "Deploying to PROD..."
+
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.rollback == 'true' }}
+    steps:
+      - name: Select rollback version
+        run: |
+          echo "Rolling back to version: ${{ github.event.inputs.version }}"
+
+      - name: Download rollback artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-${{ github.event.inputs.version }}
+
+      - name: Perform rollback
+        run: echo "Rollback to version ${{ github.event.inputs.version }} completed!"
