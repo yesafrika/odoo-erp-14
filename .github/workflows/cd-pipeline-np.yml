@@ -1,0 +1,331 @@
+name: CD Pipeline with Releases, Auto-Versioning, Unix Deployment & Auto-Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      rollback:
+        description: "Rollback? true/false"
+        required: true
+        default: "false"
+      version:
+        description: "Version to rollback to (vX.Y.Z) (required if rollback=true)"
+        required: false
+
+permissions:
+  contents: write    # needed to create tags/releases
+  actions: read
+  id-token: write
+
+env:
+  BUILD_ARTIFACT_NAME: build.zip
+
+jobs:
+  # ----------------------------
+  # 1) Generate Version (unless rollback)
+  # ----------------------------
+  generate_version:
+    name: Generate Next Version
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.rollback == 'false' }}
+    outputs:
+      new_version: ${{ steps.setver.outputs.new_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get latest tag and increment patch
+        id: setver
+        run: |
+          set -e
+          last_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v1.0.0")
+          echo "Last tag: $last_tag"
+          version=${last_tag#v}
+          IFS='.' read -r major minor patch <<< "$version"
+          patch=$((patch + 1))
+          new_version="v${major}.${minor}.${patch}"
+          echo "Generated: $new_version"
+          echo "new_version=$new_version" >> $GITHUB_OUTPUT
+
+  # ----------------------------
+  # 2) Create Release from CI build
+  # ----------------------------
+  create_release:
+    name: Create Release (Dev)
+    needs: generate_version
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.rollback == 'false' }}
+    environment: dev
+    outputs:
+      version: ${{ needs.generate_version.outputs.new_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifact from CI
+        uses: actions/download-artifact@v4
+        with:
+          name: build-package
+
+      - name: Create release and upload artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.generate_version.outputs.new_version }}
+          name: Release ${{ needs.generate_version.outputs.new_version }}
+          files: build.zip
+
+  # ----------------------------
+  # 3) Deploy to DEV (no approval)
+  # ----------------------------
+  deploy_dev:
+    name: Deploy to DEV
+    needs: create_release
+    runs-on: ubuntu-latest
+    environment: dev
+    outputs:
+      release_tag: ${{ needs.create_release.outputs.version }}
+    steps:
+      - name: Prepare SSH key
+        run: |
+          echo "${{ secrets.SSH_KEY }}" > id_rsa
+          chmod 600 id_rsa
+
+      - name: Download release asset
+        uses: robinraju/release-downloader@v1
+        with:
+          tag: ${{ needs.create_release.outputs.version }}
+          fileName: "*"
+
+      - name: Copy artifact to DEV server
+        run: |
+          scp -o StrictHostKeyChecking=no -i id_rsa ${BUILD_ARTIFACT_NAME} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST_DEV }}:/tmp/${BUILD_ARTIFACT_NAME}
+
+      - name: Deploy on DEV server and healthcheck
+        id: deploy_dev_run
+        run: |
+          ssh -o StrictHostKeyChecking=no -i id_rsa ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST_DEV }} <<'EOF'
+            set -e
+            DEPLOY_PATH="${DEPLOY_PATH:-/var/www/app}"
+            cd "$DEPLOY_PATH" || mkdir -p "$DEPLOY_PATH" && cd "$DEPLOY_PATH"
+            # Backup current
+            if [ -d current ]; then
+              mv current backups/backup_$(date +%s)
+            fi
+            mkdir -p current
+            unzip -o /tmp/${BUILD_ARTIFACT_NAME} -d current
+            sudo systemctl restart app || true
+            # health check
+            sleep 3
+            curl -f http://localhost:8080/health
+          EOF
+
+      - name: Confirm DEV deploy success
+        if: ${{ steps.deploy_dev_run.outcome == 'success' }}
+        run: echo "DEV deployment succeeded."
+
+  # ----------------------------
+  # 4) Deploy to QA (requires approval via environment)
+  # ----------------------------
+  deploy_qa:
+    name: Deploy to QA
+    needs: deploy_dev
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - name: Prepare SSH key
+        run: |
+          echo "${{ secrets.SSH_KEY }}" > id_rsa
+          chmod 600 id_rsa
+
+      - name: Download release asset
+        uses: robinraju/release-downloader@v1
+        with:
+          tag: ${{ needs.create_release.outputs.version }}
+          fileName: "*"
+
+      - name: Copy artifact to QA server
+        run: |
+          scp -o StrictHostKeyChecking=no -i id_rsa ${BUILD_ARTIFACT_NAME} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST_QA }}:/tmp/${BUILD_ARTIFACT_NAME}
+
+      - name: Deploy on QA server and healthcheck
+        id: deploy_qa_run
+        run: |
+          ssh -o StrictHostKeyChecking=no -i id_rsa ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST_QA }} <<'EOF'
+            set -e
+            DEPLOY_PATH="${DEPLOY_PATH:-/var/www/app}"
+            cd "$DEPLOY_PATH" || mkdir -p "$DEPLOY_PATH" && cd "$DEPLOY_PATH"
+            if [ -d current ]; then
+              mv current backups/backup_$(date +%s)
+            fi
+            mkdir -p current
+            unzip -o /tmp/${BUILD_ARTIFACT_NAME} -d current
+            sudo systemctl restart app || true
+            sleep 3
+            curl -f http://localhost:8080/health
+          EOF
+
+      - name: Confirm QA deploy success
+        if: ${{ steps.deploy_qa_run.outcome == 'success' }}
+        run: echo "QA deployment succeeded."
+
+  # ----------------------------
+  # 5) Deploy to UAT (requires approval)
+  # ----------------------------
+  deploy_uat:
+    name: Deploy to UAT
+    needs: deploy_qa
+    runs-on: ubuntu-latest
+    environment: uat
+    steps:
+      - name: Prepare SSH key
+        run: |
+          echo "${{ secrets.SSH_KEY }}" > id_rsa
+          chmod 600 id_rsa
+
+      - name: Download release asset
+        uses: robinraju/release-downloader@v1
+        with:
+          tag: ${{ needs.create_release.outputs.version }}
+          fileName: "*"
+
+      - name: Copy artifact to UAT server
+        run: |
+          scp -o StrictHostKeyChecking=no -i id_rsa ${BUILD_ARTIFACT_NAME} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST_UAT }}:/tmp/${BUILD_ARTIFACT_NAME}
+
+      - name: Deploy on UAT server and healthcheck
+        id: deploy_uat_run
+        run: |
+          ssh -o StrictHostKeyChecking=no -i id_rsa ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST_UAT }} <<'EOF'
+            set -e
+            DEPLOY_PATH="${DEPLOY_PATH:-/var/www/app}"
+            cd "$DEPLOY_PATH" || mkdir -p "$DEPLOY_PATH" && cd "$DEPLOY_PATH"
+            if [ -d current ]; then
+              mv current backups/backup_$(date +%s)
+            fi
+            mkdir -p current
+            unzip -o /tmp/${BUILD_ARTIFACT_NAME} -d current
+            sudo systemctl restart app || true
+            sleep 3
+            curl -f http://localhost:8080/health
+          EOF
+
+      - name: Confirm UAT deploy success
+        if: ${{ steps.deploy_uat_run.outcome == 'success' }}
+        run: echo "UAT deployment succeeded."
+
+  # ----------------------------
+  # 6) Deploy to Production (requires approval)
+  # ----------------------------
+  deploy_prod:
+    name: Deploy to Production
+    needs: deploy_uat
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Prepare SSH key
+        run: |
+          echo "${{ secrets.SSH_KEY }}" > id_rsa
+          chmod 600 id_rsa
+
+      - name: Download release asset
+        uses: robinraju/release-downloader@v1
+        with:
+          tag: ${{ needs.create_release.outputs.version }}
+          fileName: "*"
+
+      - name: Copy artifact to PROD server
+        run: |
+          scp -o StrictHostKeyChecking=no -i id_rsa ${BUILD_ARTIFACT_NAME} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST_PROD }}:/tmp/${BUILD_ARTIFACT_NAME}
+
+      - name: Deploy on PROD server and healthcheck (with automatic rollback on failure)
+        id: deploy_prod_run
+        run: |
+          set -e
+          ssh -o StrictHostKeyChecking=no -i id_rsa ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST_PROD }} <<'EOF'
+            set -e
+            DEPLOY_PATH="${DEPLOY_PATH:-/var/www/app}"
+            cd "$DEPLOY_PATH" || mkdir -p "$DEPLOY_PATH" && cd "$DEPLOY_PATH"
+
+            # create backups dir
+            mkdir -p backups
+
+            # take backup of current
+            if [ -d current ]; then
+              mv current backups/backup_$(date +%s)
+            fi
+
+            # deploy new build
+            mkdir -p current
+            unzip -o /tmp/${BUILD_ARTIFACT_NAME} -d current
+
+            # restart and health check
+            sudo systemctl restart app || true
+            sleep 5
+            if ! curl -f http://localhost:8080/health; then
+              echo "Health check failed, triggering rollback"
+              exit 2
+            fi
+          EOF
+
+      - name: Handle production deployment failure and rollback
+        if: ${{ failure() }}
+        run: |
+          echo "Production deployment failed — performing rollback"
+          echo "${{ secrets.SSH_KEY }}" > id_rsa
+          chmod 600 id_rsa
+          ssh -o StrictHostKeyChecking=no -i id_rsa ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST_PROD }} <<'EOF'
+            set -e
+            DEPLOY_PATH="${DEPLOY_PATH:-/var/www/app}"
+            cd "$DEPLOY_PATH"
+            last_backup=$(ls -dt backups/backup_* 2>/dev/null | head -n1)
+            if [ -z "$last_backup" ]; then
+              echo "No backup found. Manual intervention required."
+              exit 1
+            fi
+            rm -rf current
+            mv "$last_backup" current
+            sudo systemctl restart app || true
+          EOF
+
+  # ----------------------------
+  # 7) Manual Rollback job (trigger via workflow_dispatch rollover=true)
+  # ----------------------------
+  manual_rollback:
+    name: Manual Rollback
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.rollback == 'true' }}
+    steps:
+      - name: Validate rollback input
+        run: |
+          if [ -z "${{ github.event.inputs.version }}" ]; then
+            echo "error: provide version to rollback to (e.g., v1.0.2)"
+            exit 1
+          fi
+
+      - name: Prepare SSH key
+        run: |
+          echo "${{ secrets.SSH_KEY }}" > id_rsa
+          chmod 600 id_rsa
+
+      - name: Download requested release artifact
+        uses: robinraju/release-downloader@v1
+        with:
+          tag: ${{ github.event.inputs.version }}
+          fileName: "*"
+
+      - name: Copy artifact to PROD server and deploy rollback
+        run: |
+          scp -o StrictHostKeyChecking=no -i id_rsa ${BUILD_ARTIFACT_NAME} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST_PROD }}:/tmp/${BUILD_ARTIFACT_NAME}
+          ssh -o StrictHostKeyChecking=no -i id_rsa ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST_PROD }} <<'EOF'
+            set -e
+            DEPLOY_PATH="${DEPLOY_PATH:-/var/www/app}"
+            cd "$DEPLOY_PATH"
+            # backup current (failed) and restore rollback version
+            if [ -d current ]; then
+              mv current backups/backup_manual_$(date +%s)
+            fi
+            mkdir -p current
+            unzip -o /tmp/${BUILD_ARTIFACT_NAME} -d current
+            sudo systemctl restart app || true
+            sleep 3
+            curl -f http://localhost:8080/health
+          EOF
