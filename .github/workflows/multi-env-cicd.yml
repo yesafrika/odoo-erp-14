@@ -1,0 +1,178 @@
+name: Multi-Environment CI/CD (develop → qa → staging → prod)
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+
+jobs:
+
+  #######################################################################
+  # 1. BUILD ARTIFACT FROM DEVELOP
+  #######################################################################
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create artifact
+        run: |
+          mkdir build
+          tar -czf build/app.tar.gz .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-artifact
+          path: build/app.tar.gz
+
+
+  #######################################################################
+  # 2. PROMOTE develop → qa AND DEPLOY TO QA
+  #######################################################################
+  deploy_qa:
+    needs: build
+    environment: qa
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-artifact
+
+      - name: Deploy to QA server
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            DEPLOY_DIR="${{ secrets.DEPLOY_PATH }}"
+            RELEASES="$DEPLOY_DIR/releases"
+            CURRENT="$DEPLOY_DIR/current"
+
+            mkdir -p $RELEASES
+            TIMESTAMP=$(date +%Y%m%d%H%M%S)
+            NEW_RELEASE="$RELEASES/release_$TIMESTAMP"
+
+            mkdir -p $NEW_RELEASE
+            tar -xzf app.tar.gz -C $NEW_RELEASE
+
+            if [ -L "$CURRENT" ]; then
+              mv $CURRENT $DEPLOY_DIR/backup_$TIMESTAMP
+            fi
+
+            ln -sfn $NEW_RELEASE $CURRENT
+
+
+  #######################################################################
+  # 3. PROMOTE qa → staging AND DEPLOY TO STAGING
+  #######################################################################
+  deploy_staging:
+    needs: deploy_qa
+    environment: staging
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-artifact
+
+      - name: Deploy to Staging
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            DEPLOY_DIR="${{ secrets.DEPLOY_PATH }}"
+            RELEASES="$DEPLOY_DIR/releases"
+            CURRENT="$DEPLOY_DIR/current"
+
+            mkdir -p $RELEASES
+            TIMESTAMP=$(date +%Y%m%d%H%M%S)
+            NEW_RELEASE="$RELEASES/release_$TIMESTAMP"
+
+            mkdir -p $NEW_RELEASE
+            tar -xzf app.tar.gz -C $NEW_RELEASE
+
+            if [ -L "$CURRENT" ]; then
+              mv $CURRENT $DEPLOY_DIR/backup_$TIMESTAMP
+            fi
+
+            ln -sfn $NEW_RELEASE $CURRENT
+
+
+  #######################################################################
+  # 4. PROMOTE staging → prod (Manual Approval Required)
+  #######################################################################
+  deploy_prod:
+    needs: deploy_staging
+    environment: prod     # <-- This environment MUST have required reviewers
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-artifact
+
+      - name: Deploy to PRODUCTION
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            DEPLOY_DIR="${{ secrets.DEPLOY_PATH }}"
+            RELEASES="$DEPLOY_DIR/releases"
+            CURRENT="$DEPLOY_DIR/current"
+
+            mkdir -p $RELEASES
+            TIMESTAMP=$(date +%Y%m%d%H%M%S)
+            NEW_RELEASE="$RELEASES/release_$TIMESTAMP"
+
+            mkdir -p $NEW_RELEASE
+            tar -xzf app.tar.gz -C $NEW_RELEASE
+
+            if [ -L "$CURRENT" ]; then
+              mv $CURRENT $DEPLOY_DIR/backup_$TIMESTAMP
+            fi
+
+            ln -sfn $NEW_RELEASE $CURRENT
+
+
+  #######################################################################
+  # 5. MANUAL ROLLBACK JOB
+  #######################################################################
+  rollback:
+    runs-on: ubuntu-latest
+    environment: prod
+    if: ${{ github.event.inputs.rollback == 'true' }}
+    steps:
+      - name: Rollback to latest backup
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
+            CURRENT="$DEPLOY_PATH/current"
+
+            echo "Finding latest backup..."
+            LATEST=$(ls -td $DEPLOY_PATH/backup_* | head -n1)
+
+            if [ -z "$LATEST" ]; then
+              echo "No backups found!"
+              exit 1
+            fi
+
+            echo "Rolling back to: $LATEST"
+            ln -sfn $LATEST $CURRENT
+            echo "Rollback complete."
