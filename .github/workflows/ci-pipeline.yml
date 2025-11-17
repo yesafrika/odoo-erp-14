@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Node (optional)
-        if: ${{ files.exists(package.json) }}
+       ## if: ${{ files.exists(package.json) }}
         run: |
           # use node only if project uses node
           echo "Node step placeholder (install node if required)"
