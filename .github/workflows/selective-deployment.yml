@@ -12,7 +12,7 @@ on:
       env:
         description: "Environment to deploy"
         required: true
-        default: "prod"
+        default: "dev"
         type: choice
         options:
           - dev
