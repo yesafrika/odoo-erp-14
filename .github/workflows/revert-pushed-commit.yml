@@ -6,7 +6,7 @@ on:
       branch:
         description: 'Branch name'
         required: true
-        default: 'master'
+        default: 'main'
 
 jobs:
   revert_commit:
