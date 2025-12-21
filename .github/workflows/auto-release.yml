@@ -19,8 +19,10 @@ jobs:
       - uses: CupOfTea696/gh-action-auto-release@v1.0.0
         with:
           title: "Release: $version"
-          tag: "v$semver"
+          # tag: "v$semver"
+          tag: "/^release: v(.*)$/i"
           draft: false
-          regex: "/^Release: #{semver}$/i"
+          #regex: "/^Release: #{semver}$/i"
+          regex: "/^release: v(.*)$/i"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
