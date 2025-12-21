@@ -1,4 +1,4 @@
-Version # 2
+Version # 2.1
 https://apps.odoo.com/apps/modules/16.0/tk_construction_management
 
 https://apps.odoo.com/apps/modules/16.0/ae_construction_mgmt_comm
