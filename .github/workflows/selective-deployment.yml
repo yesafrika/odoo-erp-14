@@ -1,0 +1,165 @@
+name: Selective Deployment (File / Folder) with Safeguard
+
+on:
+  push:
+    branches:
+      - development
+      - qatest
+      - uat
+
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Environment to deploy"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - qa
+          - uat
+          - prod
+
+      source_path:
+        description: "Source file or folder"
+        required: true
+        type: string
+
+      destination_path:
+        description: "Destination path on server"
+        required: true
+        type: string
+
+      confirm_deploy:
+        description: "Type YES to confirm deployment (Safeguard)"
+        required: true
+        default: "NO"
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    # 🔐 Environment protection (GitHub UI approval required)
+    environment: ${{ github.event.inputs.env }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ---------------- SAFEGUARD 1 ----------------
+      - name: Manual Confirmation Check
+        run: |
+          if [[ "${{ github.event.inputs.confirm_deploy }}" != "YES" ]]; then
+            echo "❌ Deployment not confirmed. Type YES to proceed."
+            exit 1
+          fi
+
+      # ---------------- SAFEGUARD 2 ----------------
+      - name: Validate Destination Path
+        run: |
+          DEST="${{ github.event.inputs.destination_path }}"
+
+          BLOCKED_PATHS=("/" "/root" "/etc" "/bin" "/usr" "/var")
+
+          for path in "${BLOCKED_PATHS[@]}"; do
+            if [[ "$DEST" == "$path"* ]]; then
+              echo "❌ Dangerous path detected: $DEST"
+              exit 1
+            fi
+          done
+
+          echo "✅ Destination path validated: $DEST"
+
+      # ---------------- SAFEGUARD 3 ----------------
+      - name: Block Prod Deploy from Non-main Branch
+        run: |
+          ENV="${{ github.event.inputs.env }}"
+          BRANCH="${GITHUB_REF##*/}"
+
+          if [[ "$ENV" == "prod" && "$BRANCH" != "main" ]]; then
+            echo "❌ Production deploy allowed only from main branch"
+            exit 1
+          fi
+
+      - name: Install sshpass
+        run: sudo apt-get update && sudo apt-get install -y sshpass
+
+      - name: Detect Environment
+        id: envdetect
+        run: |
+          if [[ "${GITHUB_REF##*/}" == "development" ]]; then
+            echo "env=dev" >> $GITHUB_OUTPUT
+          elif [[ "${GITHUB_REF##*/}" == "qatest" ]]; then
+            echo "env=qa" >> $GITHUB_OUTPUT
+          elif [[ "${GITHUB_REF##*/}" == "uat" ]]; then
+            echo "env=uat" >> $GITHUB_OUTPUT
+          else
+            echo "env=${{ github.event.inputs.env }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Select Server
+        id: vars
+        run: |
+          ENV="${{ steps.envdetect.outputs.env }}"
+
+          if [[ "$ENV" == "dev" ]]; then
+            echo "server=${{ secrets.DEV_SERVER }}" >> $GITHUB_OUTPUT
+          elif [[ "$ENV" == "qa" ]]; then
+            echo "server=${{ secrets.QA_SERVER }}" >> $GITHUB_OUTPUT
+          elif [[ "$ENV" == "uat" ]]; then
+            echo "server=${{ secrets.UAT_SERVER }}" >> $GITHUB_OUTPUT
+          elif [[ "$ENV" == "prod" ]]; then
+            echo "server=${{ secrets.PROD_SERVER }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install dos2unix
+        run: sudo apt-get install -y dos2unix
+
+      - name: Normalize scripts
+        run: |
+          find . -type f -name "*.sh" -exec dos2unix {} +
+
+      # ---------------- SAFEGUARD 4 ----------------
+      - name: Auto version & audit log
+        id: version
+        run: |
+          VERSION="v$(date +'%Y.%m.%d').${{ github.run_number }}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          echo "🚀 Deploy Info"
+          echo "User: $GITHUB_ACTOR"
+          echo "Environment: ${{ steps.envdetect.outputs.env }}"
+          echo "Version: $VERSION"
+          echo "Source: ${{ github.event.inputs.source_path }}"
+          echo "Destination: ${{ github.event.inputs.destination_path }}"
+
+      - name: Create Destination Directory
+        run: |
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" \
+          ssh -o StrictHostKeyChecking=no \
+          ${{ secrets.SERVER_USER }}@${{ steps.vars.outputs.server }} \
+          "mkdir -p '${{ github.event.inputs.destination_path }}'"
+
+      - name: Upload File or Folder (Safe)
+        run: |
+          SOURCE="${{ github.event.inputs.source_path }}"
+          DEST="${{ github.event.inputs.destination_path }}"
+
+          if [ -d "$SOURCE" ]; then
+            tar -czf - -C "$SOURCE" . | \
+            sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ steps.vars.outputs.server }} \
+            "mkdir -p '$DEST' && tar -xzf - -C '$DEST'"
+          elif [ -f "$SOURCE" ]; then
+            sshpass -p "${{ secrets.SERVER_PASSWORD }}" \
+            scp -o StrictHostKeyChecking=no \
+            "$SOURCE" \
+            ${{ secrets.SERVER_USER }}@${{ steps.vars.outputs.server }}:"$DEST"
+          else
+            echo "❌ Source path not found"
+            exit 1
+          fi
+
+      - name: Deployment Complete
+        run: echo "✅ Deployment finished successfully"

@@ -1,0 +1,106 @@
+name: Full Repository Deployment (Password Based)
+
+on:
+  push:
+    branches:
+      - development
+      - qatest
+      - uat
+
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Environment to deploy (manual for prod)"
+        required: true
+        default: "prod"
+        type: choice
+        options:
+          - dev
+          - qa
+          - uat
+          - prod
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install sshpass
+        run: sudo apt-get update && sudo apt-get install -y sshpass
+
+      - name: Determine Environment From Branch or Manual Input
+        id: envdetect
+        run: |
+          if [[ "${GITHUB_REF##*/}" == "development" ]]; then
+            echo "env=dev" >> $GITHUB_OUTPUT
+          elif [[ "${GITHUB_REF##*/}" == "qatest" ]]; then
+            echo "env=qa" >> $GITHUB_OUTPUT
+          elif [[ "${GITHUB_REF##*/}" == "uat" ]]; then
+            echo "env=uat" >> $GITHUB_OUTPUT
+          else
+            echo "env=${{ github.event.inputs.env }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Define Server & Path
+        id: vars
+        run: |
+          ENV="${{ steps.envdetect.outputs.env }}"
+
+          if [[ "$ENV" == "dev" ]]; then
+            echo "server=${{ secrets.DEV_SERVER }}" >> $GITHUB_OUTPUT
+            echo "deploy_path=${{ secrets.DEV_PATH }}" >> $GITHUB_OUTPUT
+          elif [[ "$ENV" == "qa" ]]; then
+            echo "server=${{ secrets.QA_SERVER }}" >> $GITHUB_OUTPUT
+            echo "deploy_path=${{ secrets.QA_PATH }}" >> $GITHUB_OUTPUT
+          elif [[ "$ENV" == "uat" ]]; then
+            echo "server=${{ secrets.UAT_SERVER }}" >> $GITHUB_OUTPUT
+            echo "deploy_path=${{ secrets.UAT_PATH }}" >> $GITHUB_OUTPUT
+          elif [[ "$ENV" == "prod" ]]; then
+            echo "server=${{ secrets.PROD_SERVER }}" >> $GITHUB_OUTPUT
+            echo "deploy_path=${{ secrets.PROD_PATH }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Deploy Directory on Server
+        run: |
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" \
+          ssh -o StrictHostKeyChecking=no \
+          ${{ secrets.SERVER_USER }}@${{ steps.vars.outputs.server }} \
+          "mkdir -p '${{ steps.vars.outputs.deploy_path }}'"
+
+      - name: Backup Existing Deployment (QA/UAT/PROD Only)
+        if: steps.envdetect.outputs.env != 'dev'
+        run: |
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+          ${{ secrets.SERVER_USER }}@${{ steps.vars.outputs.server }} \
+          "
+          if [ -d \"${{ steps.vars.outputs.deploy_path }}\" ]; then
+            rm -rf \"${{ steps.vars.outputs.deploy_path }}.backup_\"* || true
+            mv \"${{ steps.vars.outputs.deploy_path }}\" \"${{ steps.vars.outputs.deploy_path }}.backup_\$(date +%F_%T)\"
+          fi
+          "
+
+      - name: Upload Entire Repository to Server
+        run: |
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+          ${{ secrets.SERVER_USER }}@${{ steps.vars.outputs.server }} \
+          "rm -rf \"${{ steps.vars.outputs.deploy_path }}\"/* || true"
+
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" \
+          scp -o StrictHostKeyChecking=no -r ./ \
+          ${{ secrets.SERVER_USER }}@${{ steps.vars.outputs.server }}:${{ steps.vars.outputs.deploy_path }}
+
+      - name: Rollback on Failure (Only QA/UAT/PROD)
+        if: failure() && steps.envdetect.outputs.env != 'dev'
+        run: |
+          sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+          ${{ secrets.SERVER_USER }}@${{ steps.vars.outputs.server }} \
+          "sh -c '
+            latest_backup=\$(ls -td \"${{ steps.vars.outputs.deploy_path }}.backup_\"* 2>/dev/null | head -n 1)
+            if [ ! -z \"\$latest_backup\" ]; then
+              rm -rf \"${{ steps.vars.outputs.deploy_path }}\" || true
+              mv \"\$latest_backup\" \"${{ steps.vars.outputs.deploy_path }}\"
+            fi
+          '"

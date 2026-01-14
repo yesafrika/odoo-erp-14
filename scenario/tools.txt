@@ -1,0 +1,25 @@
+import requests
+from server import mcp
+
+NWS_API_BASE = "https://api.weather.gov"
+
+@mcp.tool()
+def get_weather_alerts(state: str) -> str:
+    """
+    Get weather alerts for a US state.
+
+    Args:
+        state: Two-letter US state code (e.g. CA, NY)
+    """
+    url = f"{NWS_API_BASE}/alerts/active/area/{state}"
+    # Make the API call using the requests library
+    response = requests.get(url)
+    data = response.json()
+
+    if not data or "features" not in data:
+        return "Unable to fetch alerts or no alerts found."
+    if not data["features"]:
+        return "No active alerts for this state."
+
+    alerts = [f"{feature['properties']['severity']}: {feature['properties']['event']}" for feature in data["features"]]
+    return "\\n---\\n".join(alerts)

@@ -1,0 +1,121 @@
+name: Manual CD Pipeline (Dev → QA → UAT → Prod)
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_path:
+        description: "Target deployment directory on server"
+        required: true
+        default: "/opt/app"
+
+env:
+  APP_NAME: myapp
+  ARTIFACT_DIR: dist
+  CHECKSUM_FILE: checksums.sha256
+
+# --------------------------------------------------
+# BUILD & PACKAGE
+# --------------------------------------------------
+jobs:
+  build:
+    name: Build & Package
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dos2unix
+        run: sudo apt-get install -y dos2unix
+
+      - name: Normalize Unix line endings
+        run: |
+          find . -type f \
+            -name "*.sh" -o -name "*.env" -o -name "*.conf" \
+            | xargs dos2unix
+
+      - name: Auto version
+        id: version
+        run: |
+          VERSION="v$(date +'%Y.%m.%d').${{ github.run_number }}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create artifact bundle
+        run: |
+          mkdir -p $ARTIFACT_DIR
+          rsync -av --exclude='.git' ./ $ARTIFACT_DIR/
+          tar -czf $APP_NAME-${{ steps.version.outputs.version }}.tar.gz $ARTIFACT_DIR
+
+      - name: Generate checksum
+        run: |
+          sha256sum *.tar.gz > $CHECKSUM_FILE
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Release ${{ steps.version.outputs.version }}
+          files: |
+            *.tar.gz
+            ${{ env.CHECKSUM_FILE }}
+
+# --------------------------------------------------
+# DEPLOY TEMPLATE
+# --------------------------------------------------
+  deploy-dev:
+    name: Deploy → DEV
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/workflows/steps/deploy.yml
+        with:
+          server: ${{ secrets.DEV_SERVER }}
+          user: ${{ secrets.DEPLOY_USER }}
+          deploy_path: ${{ inputs.deploy_path }}
+          version: ${{ needs.build.outputs.version }}
+
+  deploy-qa:
+    name: Deploy → QA
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/workflows/steps/deploy.yml
+        with:
+          server: ${{ secrets.QA_SERVER }}
+          user: ${{ secrets.DEPLOY_USER }}
+          deploy_path: ${{ inputs.deploy_path }}
+          version: ${{ needs.build.outputs.version }}
+
+  deploy-uat:
+    name: Deploy → UAT
+    needs: deploy-qa
+    runs-on: ubuntu-latest
+    environment: uat
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/workflows/steps/deploy.yml
+        with:
+          server: ${{ secrets.UAT_SERVER }}
+          user: ${{ secrets.DEPLOY_USER }}
+          deploy_path: ${{ inputs.deploy_path }}
+          version: ${{ needs.build.outputs.version }}
+
+  deploy-prod:
+    name: Deploy → PROD
+    needs: deploy-uat
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/workflows/steps/deploy.yml
+        with:
+          server: ${{ secrets.PROD_SERVER }}
+          user: ${{ secrets.DEPLOY_USER }}
+          deploy_path: ${{ inputs.deploy_path }}
+          version: ${{ needs.build.outputs.version }}
